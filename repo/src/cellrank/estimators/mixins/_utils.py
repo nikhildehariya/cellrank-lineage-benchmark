@@ -1,0 +1,175 @@
+import copy
+import enum
+import logging
+from collections.abc import Callable, Iterable, Mapping, Sequence
+from typing import (
+    Any,
+    Literal,
+    NamedTuple,
+    Protocol,
+    TypeVar,
+)
+
+import numpy as np
+import pandas as pd
+from anndata import AnnData
+from wrapt import decorator
+
+from cellrank._utils._enum import ModeEnum
+from cellrank._utils._lineage import Lineage
+
+logger = logging.getLogger(__name__)
+__all__ = [
+    "BaseProtocol",
+    "log_writer",
+    "shadow",
+    "SafeGetter",
+    "StatesHolder",
+]
+
+
+class StatesHolder(NamedTuple):  # noqa: D101
+    assignment: pd.Series | None = None
+    probs: pd.Series | None = None
+    colors: np.ndarray | None = None
+    memberships: Lineage | None = None
+
+    def set(self, **kwargs: Any) -> "StatesHolder":  # noqa: D102
+        return self._replace(**kwargs)
+
+
+class PlotMode(ModeEnum):
+    EMBEDDING = enum.auto()
+    TIME = enum.auto()
+
+
+class BaseProtocol(Protocol):  # noqa: D101
+    @property
+    def adata(self) -> AnnData:  # noqa: D102
+        ...
+
+    @property
+    def backward(self) -> bool:  # noqa: D102
+        ...
+
+    @property
+    def params(self) -> dict[str, Any]:  # noqa: D102
+        ...
+
+    def _set(
+        self,
+        attr: str | None = None,
+        obj: pd.DataFrame | Mapping[str, Any] | None = None,
+        key: str | None = None,
+        value: np.ndarray | pd.Series | pd.DataFrame | Lineage | AnnData | dict[str, Any] | None = None,
+        copy: bool = True,
+        shadow_only: bool = False,
+    ) -> None: ...
+
+    def _get(
+        self,
+        *,
+        obj: pd.DataFrame | Mapping[str, Any],
+        key: str,
+        shadow_attr: Literal["obs", "obsm", "var", "varm", "uns"] | None = None,
+        dtype: type | tuple[type, ...] | None = None,
+        copy: bool = True,
+        allow_missing: bool = False,
+    ) -> Any: ...
+
+    def _create_params(
+        self,
+        locs: Mapping[str, Any] | None = None,
+        func: Callable | None = None,
+        remove: Sequence[str] = (),
+    ) -> dict[str, Any]: ...
+
+    def _read_params(self, key: str) -> dict[str, Any]: ...
+
+
+@decorator()
+def log_writer(wrapped: Callable[..., str], instance: Any, args: Any, kwargs: dict[str, Any]) -> str:
+    """Handle logging for :class:`~anndata.AnnData` writing functions of :class:`~cellrank.estimators.BaseEstimator`."""
+    import time as _time
+
+    log = kwargs.pop("log", True)
+    t0 = kwargs.pop("time", None)
+    msg = wrapped(*args, **kwargs)
+
+    if log:
+        if t0 is not None:
+            logger.info("%s (%.2fs)", msg, _time.perf_counter() - t0)
+        else:
+            logger.info(msg)
+
+    return msg
+
+
+@decorator()
+def shadow(wrapped: Callable[..., str], instance: Any, args: Any, kwargs: Mapping[str, Any]) -> str:
+    """Duplicate function call with shadow :class:`~anndata.AnnData` object.
+
+    Used to create :class:`~anndata.AnnData` serialization object in the :class:`~cellrank.estimators.BaseEstimator`.
+    """
+    res = wrapped(*args, **kwargs)
+    with instance._shadow:
+        try:
+            # don't care what the "shadowed" function returns
+            _ = wrapped(*args, **kwargs)
+        except Exception as e:  # noqa: BLE001
+            logger.error("Unable to duplicate function call using shadow `anndata.AnnData` object. Reason: `%s`", e)
+
+    return res
+
+
+class SafeGetter:
+    """Context manager that does a simple rollback on :attr:`object.__dict__`.
+
+    Used in :class:`~cellrank.estimators.BaseEstimator` to maintain consistency
+    during deserialization from :class:`~anndata.AnnData`.
+
+    Parameters
+    ----------
+    obj
+        Object to watch. Shallow copy of :attr:`obj.__dict__` is made during initialization,
+        except `_shadow_adata` (deep copy), if present.
+    allowed
+        Whether to allow these exception to occur with the context.
+
+    Notes
+    -----
+    :attr:`ok` is :obj:`False` if and only if any exception, regardless of whether it is in ``allowed``,
+    has been encountered.
+    """
+
+    def __init__(self, obj: Any, allowed: type | Sequence[type] = ()):
+        self._exc_type: TypeVar[Exception] | None = None
+        self._obj = obj
+        if not isinstance(allowed, Iterable):
+            allowed = (allowed,)
+        self._allowed = allowed
+
+        self._dict = copy.copy(obj.__dict__)
+        if "_shadow_adata" in self._dict:
+            # deepcopy `_shadow_adata` (small cost) to easily revert changes
+            # do not run deepcopy on the full `__dict__` (possibly large cost)
+            # silent assumption is that within the context `adata` is not modified
+            self._dict["_shadow_adata"] = copy.deepcopy(self._dict["_shadow_adata"])
+
+    def __enter__(self) -> "SafeGetter":
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb) -> bool:
+        self._exc_type = exc_type
+        # TODO(michalk8): log properly
+        if not self.ok:
+            logger.debug("The estimator will not be completely initialized, reason: %s", exc_type(exc_val))
+            self._obj.__dict__ = self._dict
+            return self._exc_type in self._allowed
+
+        return True
+
+    @property
+    def ok(self) -> bool:
+        """Return :obj:`True` if no exception has been raised."""
+        return self._exc_type is None
